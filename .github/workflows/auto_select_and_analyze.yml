@@ -1,0 +1,120 @@
+name: 每日自动选股+分析
+
+on:
+  schedule:
+    # 北京时间 09:35 = UTC 01:35，仅工作日
+    - cron: '35 1 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      top_n:
+        description: '选取股票数量（默认50）'
+        required: false
+        default: '50'
+      force_run:
+        description: '强制运行（非交易日也执行）'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  # ── Job 1: 自动选股 ───────────────────────────
+  select_stocks:
+    name: 自动筛选今日热门股（09:35）
+    runs-on: ubuntu-latest
+    outputs:
+      stock_list: ${{ steps.select.outputs.stock_list }}
+      stock_count: ${{ steps.select.outputs.stock_count }}
+      should_run: ${{ steps.check.outputs.should_run }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install akshare pandas --quiet
+
+      - name: 判断是否交易日
+        id: check
+        run: |
+          python3 - << 'PYEOF'
+          import datetime, os
+          force = "${{ github.event.inputs.force_run }}" == "true"
+          now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+          is_weekday = now.weekday() < 5
+          run = force or is_weekday
+          print(f"{'交易日' if is_weekday else '非交易日'} {now.strftime('%Y-%m-%d %A')} → {'执行' if run else '跳过'}")
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"should_run={'true' if run else 'false'}\n")
+          PYEOF
+
+      - name: 执行选股（已过滤停牌/一字板/次新股）
+        id: select
+        if: steps.check.outputs.should_run == 'true'
+        run: python3 select_stocks.py ${{ github.event.inputs.top_n || 50 }}
+
+      - name: 上传选股结果
+        if: steps.check.outputs.should_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: selected-stocks-${{ github.run_id }}
+          path: selected_stocks.json
+          retention-days: 30
+
+  # ── Job 2: 触发分析 ───────────────────────────
+  trigger_analysis:
+    name: 更新股票池并触发分析
+    needs: select_stocks
+    runs-on: ubuntu-latest
+    if: needs.select_stocks.outputs.should_run == 'true' && needs.select_stocks.outputs.stock_list != ''
+
+    steps:
+      - name: 显示今日选股
+        run: |
+          echo "================================================"
+          echo "📊 今日自动选股完成（已过滤停牌/一字板/次新股）"
+          echo "股票数量: ${{ needs.select_stocks.outputs.stock_count }} 只"
+          echo "股票列表: ${{ needs.select_stocks.outputs.stock_list }}"
+          echo "================================================"
+
+      - name: 更新 STOCK_LIST 并触发分析
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STOCK_LIST: ${{ needs.select_stocks.outputs.stock_list }}
+        run: |
+          REPO="${{ github.repository }}"
+
+          # 尝试更新已有变量
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/variables/STOCK_LIST" \
+            -d "{\"name\":\"STOCK_LIST\",\"value\":\"$STOCK_LIST\"}")
+
+          if [ "$STATUS" = "204" ]; then
+            echo "✅ STOCK_LIST 更新成功"
+          elif [ "$STATUS" = "404" ]; then
+            # 变量不存在则创建
+            curl -s -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/actions/variables" \
+              -d "{\"name\":\"STOCK_LIST\",\"value\":\"$STOCK_LIST\"}"
+            echo "✅ STOCK_LIST 创建成功"
+          else
+            echo "⚠️ HTTP $STATUS，继续使用原有 STOCK_LIST"
+          fi
+
+          sleep 3
+
+          # 触发分析工作流
+          curl -s -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/workflows/analyze.yml/dispatches" \
+            -d '{"ref":"main"}'
+
+          echo "✅ 分析工作流已触发，约30分钟后完成"
